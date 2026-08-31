@@ -1,7 +1,14 @@
 import { prisma } from "@/lib/prisma";
-import { getUserId, parseTargetMinutes, toDTO, unauthorized } from "../route";
+import {
+  getUserId,
+  parsePlannedDate,
+  parseTargetMinutes,
+  toDTO,
+  unauthorized,
+} from "../route";
 import type { ApiError, TodoDTO } from "../route";
-import type { Prisma } from "@prisma/client";
+import { dateOnlyUTC, jstDateString } from "@/lib/jst";
+import type { Prisma, Todo } from "@prisma/client";
 
 // ---- API の型定義（画面側は import type で参照する） ----
 
@@ -9,11 +16,13 @@ import type { Prisma } from "@prisma/client";
  * 部分更新。送られたキーだけ反映する。
  * - `isCompleted` … 完了フラグ
  * - `targetMinutes` … 目標時間（分）。null で未設定に戻す
+ * - `plannedDate` … 予定日 "YYYY-MM-DD"。null で未設定に戻す
  * - `timer` … ストップウォッチ操作。"start" で計測開始、"stop" で累計に加算して停止
  */
 export type UpdateTodoRequest = {
   isCompleted?: boolean;
   targetMinutes?: number | null;
+  plannedDate?: string | null;
   timer?: "start" | "stop";
 };
 export type UpdateTodoResponse = { todo: TodoDTO };
@@ -56,6 +65,8 @@ export async function PATCH(
 
   const data: Prisma.TodoUpdateInput = {};
   let recognized = false;
+  // タイマー停止で確定した「今回の計測秒」。0 より大きいとき study_daily に加算する。
+  let studyGainSeconds = 0;
 
   if ("isCompleted" in patch) {
     if (typeof patch.isCompleted !== "boolean") {
@@ -74,6 +85,15 @@ export async function PATCH(
     data.targetMinutes = parsed.value;
   }
 
+  if ("plannedDate" in patch) {
+    const parsed = parsePlannedDate(patch.plannedDate);
+    if (!parsed.ok) {
+      return badRequest("plannedDate must be YYYY-MM-DD or null");
+    }
+    recognized = true;
+    data.plannedDate = parsed.value;
+  }
+
   if ("timer" in patch) {
     if (patch.timer !== "start" && patch.timer !== "stop") {
       return badRequest('timer must be "start" or "stop"');
@@ -87,7 +107,8 @@ export async function PATCH(
       const elapsed = Math.floor(
         (Date.now() - owned.timerStartedAt.getTime()) / 1000,
       );
-      data.studiedSeconds = owned.studiedSeconds + Math.max(0, elapsed);
+      studyGainSeconds = Math.max(0, elapsed);
+      data.studiedSeconds = owned.studiedSeconds + studyGainSeconds;
       data.timerStartedAt = null;
     }
   }
@@ -99,7 +120,23 @@ export async function PATCH(
     return Response.json({ todo: toDTO(owned) } satisfies UpdateTodoResponse);
   }
 
-  const row = await prisma.todo.update({ where: { id }, data });
+  let row: Todo;
+  if (studyGainSeconds > 0) {
+    // タイマー停止: todos の更新と日次集計への加算を1トランザクションで行う
+    const day = dateOnlyUTC(jstDateString());
+    const [updated] = await prisma.$transaction([
+      prisma.todo.update({ where: { id }, data }),
+      prisma.studyDaily.upsert({
+        where: { userId_day: { userId, day } },
+        create: { userId, day, seconds: studyGainSeconds },
+        update: { seconds: { increment: studyGainSeconds } },
+      }),
+    ]);
+    row = updated;
+  } else {
+    row = await prisma.todo.update({ where: { id }, data });
+  }
+
   return Response.json({ todo: toDTO(row) } satisfies UpdateTodoResponse);
 }
 

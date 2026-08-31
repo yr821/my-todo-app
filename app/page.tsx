@@ -14,6 +14,7 @@ import type {
   UpdateTodoRequest,
   UpdateTodoResponse,
 } from "@/app/api/todos/[id]/route";
+import type { StudySummary } from "@/app/api/study/summary/route";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
@@ -65,10 +66,25 @@ function parseMinutesInput(raw: string): { ok: boolean; value: number | null } {
   return { ok: true, value: n };
 }
 
+/** ローカル日付を "YYYY-MM-DD" に（集計は JST 基準。日本環境なら一致する） */
+function localDateString(d: Date = new Date()): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/** "YYYY-MM-DD" → "M/D" */
+function shortDate(iso: string): string {
+  const [, m, d] = iso.split("-");
+  return `${Number(m)}/${Number(d)}`;
+}
+
 export default function Home() {
   const [todos, setTodos] = useState<TodoDTO[]>([]);
   const [title, setTitle] = useState("");
   const [targetInput, setTargetInput] = useState("");
+  const [plannedInput, setPlannedInput] = useState("");
   const [email, setEmail] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -76,8 +92,21 @@ export default function Home() {
   const [nowTs, setNowTs] = useState(() => Date.now());
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTarget, setEditTarget] = useState("");
+  const [editDate, setEditDate] = useState("");
+  const [summary, setSummary] = useState<StudySummary | null>(null);
+  const [summaryDate, setSummaryDate] = useState("");
 
-  // 初回ロード：ログインユーザーのメールと TODO 一覧を取得
+  /** 勉強時間サマリー（今日 / 今週 / 指定日）を取得する。補助表示なのでエラーは無視。 */
+  const loadSummary = useCallback(async (date: string) => {
+    try {
+      const res = await ensureOk(await fetch(`/api/study/summary?date=${date}`));
+      setSummary((await res.json()) as StudySummary);
+    } catch {
+      // サマリーは無くても本機能は動くため握りつぶす
+    }
+  }, []);
+
+  // 初回ロード：メール / TODO 一覧 / 集計を取得。集計日はクライアントのローカル日付で初期化。
   useEffect(() => {
     const supabase = createClient();
 
@@ -86,6 +115,9 @@ export default function Home() {
     });
 
     void (async () => {
+      const today = localDateString();
+      setSummaryDate(today);
+      void loadSummary(today);
       try {
         const res = await ensureOk(await fetch("/api/todos"));
         const data = (await res.json()) as GetTodosResponse;
@@ -96,7 +128,7 @@ export default function Home() {
         setLoading(false);
       }
     })();
-  }, []);
+  }, [loadSummary]);
 
   // 計測中の TODO があるときだけ 1 秒ごとに再描画する
   const hasRunning = todos.some((t) => t.timerStartedAt);
@@ -105,6 +137,15 @@ export default function Home() {
     const timer = setInterval(() => setNowTs(Date.now()), 1000);
     return () => clearInterval(timer);
   }, [hasRunning]);
+
+  /** 集計日を変えてサマリーを取り直す */
+  const changeSummaryDate = useCallback(
+    (date: string) => {
+      setSummaryDate(date);
+      if (date) void loadSummary(date);
+    },
+    [loadSummary],
+  );
 
   /** PATCH を投げ、成功レスポンスで該当行を置換する共通処理 */
   const patchTodo = useCallback(
@@ -149,6 +190,7 @@ export default function Home() {
         const body: CreateTodoRequest = {
           title: trimmed,
           targetMinutes: target.value,
+          plannedDate: plannedInput === "" ? null : plannedInput,
         };
         const res = await ensureOk(
           await fetch("/api/todos", {
@@ -161,41 +203,43 @@ export default function Home() {
         setTodos((prev) => [...prev, data.todo]);
         setTitle("");
         setTargetInput("");
+        setPlannedInput("");
       } catch (err) {
         setError(err instanceof Error ? err.message : "追加に失敗しました");
       } finally {
         setSubmitting(false);
       }
     },
-    [title, targetInput, submitting],
+    [title, targetInput, plannedInput, submitting],
   );
 
   const toggleTodo = useCallback(
     (todo: TodoDTO) =>
-      patchTodo(
-        todo.id,
-        { isCompleted: !todo.isCompleted },
-        "更新に失敗しました",
-      ),
+      patchTodo(todo.id, { isCompleted: !todo.isCompleted }, "更新に失敗しました"),
     [patchTodo],
   );
 
   const toggleTimer = useCallback(
-    (todo: TodoDTO) =>
-      patchTodo(
+    async (todo: TodoDTO) => {
+      const wasRunning = todo.timerStartedAt !== null;
+      const ok = await patchTodo(
         todo.id,
-        { timer: todo.timerStartedAt ? "stop" : "start" },
+        { timer: wasRunning ? "stop" : "start" },
         "計測の更新に失敗しました",
-      ),
-    [patchTodo],
+      );
+      // 停止したら今日 / 今週の合計が増えるのでサマリーを更新
+      if (ok && wasRunning && summaryDate) void loadSummary(summaryDate);
+    },
+    [patchTodo, loadSummary, summaryDate],
   );
 
-  const startEditTarget = useCallback((todo: TodoDTO) => {
+  const startEdit = useCallback((todo: TodoDTO) => {
     setEditingId(todo.id);
     setEditTarget(todo.targetMinutes === null ? "" : String(todo.targetMinutes));
+    setEditDate(todo.plannedDate ?? "");
   }, []);
 
-  const saveTarget = useCallback(
+  const saveEdit = useCallback(
     async (id: string) => {
       const target = parseMinutesInput(editTarget);
       if (!target.ok) {
@@ -204,12 +248,15 @@ export default function Home() {
       }
       const ok = await patchTodo(
         id,
-        { targetMinutes: target.value },
-        "目標時間の更新に失敗しました",
+        {
+          targetMinutes: target.value,
+          plannedDate: editDate === "" ? null : editDate,
+        },
+        "更新に失敗しました",
       );
       if (ok) setEditingId(null);
     },
-    [editTarget, patchTodo],
+    [editTarget, editDate, patchTodo],
   );
 
   const removeTodo = useCallback(async (id: string) => {
@@ -224,11 +271,17 @@ export default function Home() {
 
   return (
     <div className="flex flex-1 flex-col bg-zinc-950">
-      <header className="flex items-center justify-between gap-3 border-b border-zinc-800 px-4 py-3 sm:px-6">
+      <header className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-b border-zinc-800 px-4 py-3 sm:px-6">
         <span className="font-semibold text-zinc-50">My TODO App</span>
         <div className="flex items-center gap-3">
+          {summary && (
+            <span className="text-xs text-zinc-400">
+              今日 {formatTotal(summary.today)} ／ 今週{" "}
+              {formatTotal(summary.week)}
+            </span>
+          )}
           {email && (
-            <span className="max-w-[40vw] truncate text-sm text-zinc-400">
+            <span className="max-w-[32vw] truncate text-sm text-zinc-400">
               {email}
             </span>
           )}
@@ -238,6 +291,17 @@ export default function Home() {
 
       <main className="mx-auto w-full max-w-xl flex-1 px-4 py-10">
         <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-5 shadow-lg sm:p-6">
+          <div className="mb-4 flex flex-wrap items-center gap-2 text-sm text-zinc-400">
+            <input
+              type="date"
+              aria-label="集計する日"
+              value={summaryDate}
+              onChange={(e) => changeSummaryDate(e.target.value)}
+              className="rounded-md border border-zinc-700 bg-zinc-950 px-2 py-1 text-zinc-50 outline-none focus:border-zinc-400"
+            />
+            <span>の合計 {summary ? formatTotal(summary.day) : "—"}</span>
+          </div>
+
           <form onSubmit={addTodo} className="flex flex-col gap-2">
             <input
               type="text"
@@ -247,7 +311,7 @@ export default function Home() {
               aria-label="勉強する内容"
               className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-zinc-50 outline-none focus:border-zinc-400"
             />
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <label htmlFor="target-input" className="text-sm text-zinc-400">
                 目標
               </label>
@@ -261,6 +325,13 @@ export default function Home() {
                 className="w-20 rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-zinc-50 outline-none focus:border-zinc-400"
               />
               <span className="text-sm text-zinc-400">分</span>
+              <input
+                type="date"
+                value={plannedInput}
+                onChange={(e) => setPlannedInput(e.target.value)}
+                aria-label="予定日"
+                className="rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-zinc-50 outline-none focus:border-zinc-400"
+              />
               <button
                 type="submit"
                 disabled={submitting || !title.trim()}
@@ -326,6 +397,12 @@ export default function Home() {
                           ` / 目標 ${todo.targetMinutes}分`}
                       </span>
 
+                      {todo.plannedDate && (
+                        <span className="text-zinc-400">
+                          予定 {shortDate(todo.plannedDate)}
+                        </span>
+                      )}
+
                       {ratio !== null && (
                         <span
                           className="h-1.5 w-20 overflow-hidden rounded-full bg-zinc-800"
@@ -339,18 +416,25 @@ export default function Home() {
                       )}
 
                       {editingId === todo.id ? (
-                        <span className="flex items-center gap-1.5">
+                        <span className="flex flex-wrap items-center gap-1.5">
                           <input
                             type="number"
                             value={editTarget}
                             onChange={(e) => setEditTarget(e.target.value)}
                             aria-label="目標時間（分）"
                             min={0}
-                            className="w-20 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-zinc-50 outline-none focus:border-zinc-400"
+                            className="w-16 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-zinc-50 outline-none focus:border-zinc-400"
+                          />
+                          <input
+                            type="date"
+                            value={editDate}
+                            onChange={(e) => setEditDate(e.target.value)}
+                            aria-label="予定日"
+                            className="rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-zinc-50 outline-none focus:border-zinc-400"
                           />
                           <button
                             type="button"
-                            onClick={() => saveTarget(todo.id)}
+                            onClick={() => saveEdit(todo.id)}
                             className="text-zinc-200 hover:text-zinc-50"
                           >
                             保存
@@ -366,10 +450,10 @@ export default function Home() {
                       ) : (
                         <button
                           type="button"
-                          onClick={() => startEditTarget(todo)}
+                          onClick={() => startEdit(todo)}
                           className="text-zinc-500 transition-colors hover:text-zinc-300"
                         >
-                          目標を編集
+                          編集
                         </button>
                       )}
 
