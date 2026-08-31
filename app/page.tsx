@@ -95,6 +95,7 @@ export default function Home() {
   const [editDate, setEditDate] = useState("");
   const [summary, setSummary] = useState<StudySummary | null>(null);
   const [summaryDate, setSummaryDate] = useState("");
+  const [hideCompleted, setHideCompleted] = useState(false);
 
   /** 勉強時間サマリー（今日 / 今週 / 指定日）を取得する。補助表示なのでエラーは無視。 */
   const loadSummary = useCallback(async (date: string) => {
@@ -129,6 +130,12 @@ export default function Home() {
       }
     })();
   }, [loadSummary]);
+
+  const completedCount = todos.filter((t) => t.isCompleted).length;
+  // 未完了を上、完了を下へ（各グループ内は取得順＝追加順のまま）。完了非表示なら除外。
+  const visibleTodos = [...todos]
+    .filter((t) => !(hideCompleted && t.isCompleted))
+    .sort((a, b) => Number(a.isCompleted) - Number(b.isCompleted));
 
   // 計測中の TODO があるときだけ 1 秒ごとに再描画する
   const hasRunning = todos.some((t) => t.timerStartedAt);
@@ -344,15 +351,31 @@ export default function Home() {
 
           {error && <p className="mt-3 text-sm text-red-400">{error}</p>}
 
+          {!loading && completedCount > 0 && (
+            <label className="mt-4 flex items-center justify-end gap-2 text-sm text-zinc-400">
+              <input
+                type="checkbox"
+                checked={hideCompleted}
+                onChange={(e) => setHideCompleted(e.target.checked)}
+                className="size-4 accent-zinc-50"
+              />
+              完了を隠す（{completedCount}）
+            </label>
+          )}
+
           {loading ? (
             <p className="mt-6 text-center text-sm text-zinc-500">読み込み中...</p>
           ) : todos.length === 0 ? (
             <p className="mt-6 text-center text-sm text-zinc-500">
               TODO はまだありません
             </p>
+          ) : visibleTodos.length === 0 ? (
+            <p className="mt-6 text-center text-sm text-zinc-500">
+              完了はすべて非表示です
+            </p>
           ) : (
-            <ul className="mt-4 flex flex-col divide-y divide-zinc-800">
-              {todos.map((todo) => {
+            <ul className="mt-3 flex flex-col divide-y divide-zinc-800">
+              {visibleTodos.map((todo) => {
                 const total = elapsedSeconds(todo, nowTs);
                 const running = todo.timerStartedAt !== null;
                 const ratio =
