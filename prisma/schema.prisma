@@ -9,11 +9,25 @@ datasource db {
 }
 
 model Todo {
-  id          String   @id @default(uuid()) @db.Uuid
-  userId      String   @map("user_id") @db.Uuid
-  title       String
-  isCompleted Boolean  @default(false) @map("is_completed")
-  createdAt   DateTime @default(now()) @map("created_at")
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  title          String
+  isCompleted    Boolean   @default(false) @map("is_completed")
+  targetMinutes  Int?      @map("target_minutes")
+  studiedSeconds Int       @default(0) @map("studied_seconds")
+  timerStartedAt DateTime? @map("timer_started_at")
+  plannedDate    DateTime? @map("planned_date") @db.Date
+  createdAt      DateTime  @default(now()) @map("created_at")
 
   @@map("todos")
+}
+
+/// 日次の勉強時間ロールアップ（ユーザー×日ごとの累計秒）
+model StudyDaily {
+  userId  String   @map("user_id") @db.Uuid
+  day     DateTime @db.Date
+  seconds Int      @default(0)
+
+  @@id([userId, day])
+  @@map("study_daily")
 }
